@@ -3,6 +3,7 @@ import pytest
 import logging
 import time
 from tests.common.helpers.assertions import pytest_assert
+from tests.common.utilities import wait_until
 from tests.common.platform.transceiver_utils import parse_transceiver_info
 from tests.common.reboot import reboot, REBOOT_TYPE_COLD
 
@@ -34,13 +35,10 @@ def check_services(duthost):
     Perform a health check of services
     """
     logging.info("Wait until all critical services are fully started")
-    # Wait until 300 seconds after boot up since a part of the services has delayed start (e.g., snmp)
-    wait_until_uptime(duthost, 300)
+    pytest_assert(wait_until(330, 30, 0, duthost.critical_services_fully_started),
+                  "dut.critical_services_fully_started is False")
 
     logging.info("Check critical service status")
-    if not duthost.critical_services_fully_started():
-        raise RebootHealthError("dut.critical_services_fully_started is False")
-
     for service in duthost.critical_services:
         status = duthost.get_service_props(service)
         if status["ActiveState"] != "active":
@@ -168,21 +166,20 @@ def add_fail_step_to_reboot(localhost, duthosts, rand_one_dut_hostname):
         elif "fast" in reboot_type:
             reboot_script = "fast-reboot"
 
-        cmd_format = "sed -i 's/{}/{}/' {}"
+        cmd_format = "sed -i -u 's/{}/{}/' {}"
         reboot_script_path = duthost.shell('which {}'.format(reboot_script))['stdout']
-        original_line = 'set +e'
-        replaced_line = 'exit -1; set +e'
+        original_line = '^setup_control_plane_assistant$'
+        replaced_line = 'exit -1; setup_control_plane_assistant'
         replace_cmd = cmd_format.format(original_line, replaced_line, reboot_script_path)
         logging.info("Modify {} to exit before set +e".format(reboot_script_path))
         duthost.shell(replace_cmd)
         add_exit_to_script.params = (cmd_format, replaced_line, original_line, reboot_script_path, reboot_script_path)
 
-
     yield add_exit_to_script
 
     if add_exit_to_script.params:
         cmd_format, replaced_line, original_line, reboot_script_path, reboot_script_path = add_exit_to_script.params
-        replace_cmd = cmd_format.format(replaced_line, original_line, reboot_script_path)
+        replace_cmd = cmd_format.format(replaced_line, "setup_control_plane_assistant", reboot_script_path)
         logging.info("Revert {} script to original".format(reboot_script_path))
         duthost.shell(replace_cmd)
     # cold reboot DUT to restore any bad state caused by negative test

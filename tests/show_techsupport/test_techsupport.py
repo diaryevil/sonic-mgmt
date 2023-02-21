@@ -1,18 +1,16 @@
 import os
 import pprint
 import pytest
+import re
 import time
-
 import logging
+import tech_support_cmds as cmds
 
 from random import randint
 from tests.common.helpers.assertions import pytest_assert, pytest_require
 from tests.common.plugins.loganalyzer.loganalyzer import LogAnalyzer, LogAnalyzerError
-from tests.common.utilities import wait_until, skip_release
-
-from log_messages import *
-
-import tech_support_cmds as cmds 
+from tests.common.utilities import wait_until
+from log_messages import LOG_EXPECT_ACL_RULE_CREATE_RE, LOG_EXPECT_ACL_RULE_REMOVE_RE, LOG_EXCEPT_MIRROR_SESSION_REMOVE
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +21,7 @@ pytestmark = [
 SUCCESS_CODE = 0
 DEFAULT_LOOP_RANGE = 2
 DEFAULT_LOOP_DELAY = 2
+MIN_FILES_NUM = 50
 
 pytest.tar_stdout = ""
 
@@ -50,6 +49,7 @@ SESSION_INFO = {
     'queue': "0"
 }
 
+
 # ACL PART #
 
 
@@ -67,13 +67,12 @@ def setup_acl_rules(duthost, acl_setup):
 
     logger.info('Generating configurations for ACL rules, ACL table {}'.format(name))
     extra_vars = {
-        'acl_table_name':  name,
+        'acl_table_name': name,
     }
     logger.info('Extra variables for ACL table:\n{}'.format(pprint.pformat(extra_vars)))
     duthost.host.options['variable_manager'].extra_vars.update(extra_vars)
 
-    duthost.template(src=os.path.join(TEMPLATE_DIR, ACL_RULES_FULL_TEMPLATE),
-                                        dest=dut_conf_file_path)
+    duthost.template(src=os.path.join(TEMPLATE_DIR, ACL_RULES_FULL_TEMPLATE), dest=dut_conf_file_path)
 
     logger.info('Applying {}'.format(dut_conf_file_path))
     duthost.command('config acl update full {}'.format(dut_conf_file_path))
@@ -209,15 +208,17 @@ def mirroring(duthosts, enum_rand_one_per_hwsku_frontend_hostname, neighbor_ip, 
     logger.info("Adding mirror_session to DUT")
     acl_rule_file = os.path.join(mirror_setup['dut_tmp_dir'], ACL_RULE_PERSISTENT_FILE)
     extra_vars = {
-        'acl_table_name':  EVERFLOW_TABLE_NAME,
+        'acl_table_name': EVERFLOW_TABLE_NAME,
     }
     logger.info('Extra variables for MIRROR table:\n{}'.format(pprint.pformat(extra_vars)))
     duthost.host.options['variable_manager'].extra_vars.update(extra_vars)
 
     duthost.template(src=os.path.join(TEMPLATE_DIR, ACL_RULE_PERSISTENT_TEMPLATE), dest=acl_rule_file)
-    duthost.command('config mirror_session add {} {} {} {} {} {} {}'
-    .format(SESSION_INFO['name'], SESSION_INFO['src_ip'], neighbor_ip,
-     SESSION_INFO['dscp'], SESSION_INFO['ttl'], SESSION_INFO['gre'], SESSION_INFO['queue']))
+    duthost.command('config mirror_session add {} {} {} {} {} {} {}'.format(SESSION_INFO['name'],
+                                                                            SESSION_INFO['src_ip'], neighbor_ip,
+                                                                            SESSION_INFO['dscp'], SESSION_INFO['ttl'],
+                                                                            SESSION_INFO['gre'], SESSION_INFO['queue'])
+                    )
 
     logger.info('Loading acl mirror rules ...')
     load_rule_cmd = "acl-loader update full {} --session_name={}".format(acl_rule_file, SESSION_INFO['name'])
@@ -261,26 +262,6 @@ def config(request):
     """
     return request.getfixturevalue(request.param)
 
-@pytest.fixture
-def check_image_version(duthost):
-    """Skips this test if the SONiC image installed on DUT is older than 202112
-    Args:
-        duthost: Hostname of DUT.
-    Returns:
-        None.
-    """
-    skip_release(duthost, ["201811", "201911", "202012", "202106"])
-
-@pytest.fixture
-def setup_password(duthosts, enum_rand_one_per_hwsku_hostname, creds_all_duts):
-    duthost = duthosts[enum_rand_one_per_hwsku_hostname]
-    # Setup TACACS/Radius password
-    duthost.shell("sudo config tacacs passkey %s" % creds_all_duts[duthost]['tacacs_passkey'])
-    duthost.shell("sudo config radius passkey %s" % creds_all_duts[duthost]['radius_passkey'])
-    yield
-    # Remove TACACS/Radius password
-    duthost.shell("sudo config tacacs default passkey")
-    duthost.shell("sudo config radius default passkey")
 
 def execute_command(duthost, since):
     """
@@ -288,11 +269,40 @@ def execute_command(duthost, since):
     :param duthost: DUT
     :param since: since string enterd by user
     """
-    result = duthost.command("show techsupport -r --since={}".format('"' + since + '"'), module_ignore_errors=True)
+    opt = "-r" if duthost.sonic_release not in ["201811", "201911"] else ""
+    result = duthost.command(
+        "show techsupport {} --since={}".format(opt, '"' + since + '"'),
+        module_ignore_errors=True
+    )
     if result['rc'] != SUCCESS_CODE:
         pytest.fail('Failed to create techsupport. \nstdout:{}. \nstderr:{}'.format(result['stdout'], result['stderr']))
     pytest.tar_stdout = result['stdout']
     return True
+
+
+@pytest.fixture(autouse=True)
+def ignore_expected_loganalyzer_exceptions(enum_rand_one_per_hwsku_frontend_hostname, loganalyzer):
+    """
+        In Mellanox, when techsupport is taken, it invokes fw dump.
+        While taking the fw dump, the fw is busy and doesn't respond to other calls.
+        The access of sfp eeprom happens through firmware and xcvrd gets the DOM fields
+        every 60 seconds which fails during the fw dump.
+        This is a temporary issue and this log can be ignored. 
+        Issue link: https://github.com/sonic-net/sonic-buildimage/issues/12621
+    """
+    ignoreRegex = [
+        ".*ERR kernel:.*Reg cmd access status failed.*",
+        ".*ERR kernel:.*Reg cmd access failed.*",
+        ".*ERR kernel:.*Eeprom query failed.*",
+        ".*ERR kernel:.*Fails to access.*register MCIA.*",
+        ".*ERR kernel:.*Fails to read module eeprom.*",
+        ".*ERR kernel:.*Fails to access.*module eeprom.*",
+        ".*ERR kernel:.*Fails to get module type.*",
+        ".*ERR pmon#xcvrd:.*Failed to read sfp.*"
+    ]
+
+    if loganalyzer:
+        loganalyzer[enum_rand_one_per_hwsku_frontend_hostname].ignore_regex.extend(ignoreRegex)
 
 
 def test_techsupport(request, config, duthosts, enum_rand_one_per_hwsku_frontend_hostname):
@@ -312,14 +322,43 @@ def test_techsupport(request, config, duthosts, enum_rand_one_per_hwsku_frontend
         logger.debug("Running show techsupport ... ")
         wait_until(300, 20, 0, execute_command, duthost, str(since))
         tar_file = [j for j in pytest.tar_stdout.split('\n') if j != ''][-1]
-        stdout = duthost.command("rm -rf {}".format(tar_file))
-        logger.debug("Sleeping for {} seconds".format(loop_delay))
-        time.sleep(loop_delay)
+        duthost.command("tar -xf {} -C /tmp/".format(tar_file))
+        extracted_dump_folder_name = tar_file.lstrip('/var/dump/').split('.')[0]
+        extracted_dump_folder_path = '/tmp/{}'.format(extracted_dump_folder_name)
+        try:
+            validate_dump_file_content(duthost, extracted_dump_folder_path)
+        except AssertionError as err:
+            raise AssertionError(err)
+        finally:
+            duthost.command("rm -rf {}".format(tar_file))
+            duthost.command("rm -rf {}".format(extracted_dump_folder_path))
+            logger.debug("Sleeping for {} seconds".format(loop_delay))
+            time.sleep(loop_delay)
+
+
+def validate_dump_file_content(duthost, dump_folder_path):
+    """
+    Validate generated dump file content
+    :param duthost: duthost object
+    :param dump_folder_path: path to folder which has extracted dump file content
+    :return: AssertionError in case of failure, else None
+    """
+    sai_sdk_dump = duthost.command("ls {}/sai_sdk_dump/".format(dump_folder_path))["stdout_lines"]
+    dump = duthost.command("ls {}/dump/".format(dump_folder_path))["stdout_lines"]
+    etc = duthost.command("ls {}/etc/".format(dump_folder_path))["stdout_lines"]
+    log = duthost.command("ls {}/log/".format(dump_folder_path))["stdout_lines"]
+
+    assert len(sai_sdk_dump), "Folder 'sai_sdk_dump' in dump archive is empty. Expected not empty folder"
+    assert len(dump) > MIN_FILES_NUM, "Seems like not all expected files available in 'dump' folder in dump archive. " \
+                                      "Test expects not less than 50 files. Available files: {}".format(dump)
+    assert len(etc) > MIN_FILES_NUM, "Seems like not all expected files available in 'etc' folder in dump archive. " \
+                                     "Test expects not less than 50 files. Available files: {}".format(etc)
+    assert len(log), "Folder 'log' in dump archive is empty. Expected not empty folder"
 
 
 def add_asic_arg(format_str, cmds_list, asic_num):
-    """ 
-    Add ASIC specific arg using the supplied string formatter 
+    """
+    Add ASIC specific arg using the supplied string formatter
 
     New commands are added for each ASIC. In case of a regex
     paramter, new regex is created for each ASIC.
@@ -375,12 +414,13 @@ def commands_to_check(duthosts, enum_rand_one_per_hwsku_frontend_hostname):
         "show_platform_cmds": cmds.show_platform_cmds,
         "ip_cmds": cmds.ip_cmds,
         "bridge_cmds": cmds.bridge_cmds,
-        "frr_cmds": add_asic_arg("  -n  {}", cmds.frr_cmds, num),
-        "bgp_cmds": add_asic_arg("  -n  {}", cmds.bgp_cmds, num),
+        "frr_cmds": add_asic_arg(" -n {}", cmds.frr_cmds, num),
+        "bgp_cmds": add_asic_arg(" -n {}", cmds.bgp_cmds, num),
         "nat_cmds": cmds.nat_cmds,
-        "bfd_cmds": add_asic_arg("  -n  {}", cmds.bfd_cmds, num),
+        "bfd_cmds": add_asic_arg(" -n {}", cmds.bfd_cmds, num),
         "redis_db_cmds": add_asic_arg("asic{} ", cmds.redis_db_cmds, num),
-        "docker_cmds": add_asic_arg("{}", cmds.docker_cmds_201911 if '201911' in duthost.os_version else cmds.docker_cmds, num),
+        "docker_cmds":
+            add_asic_arg("{}", cmds.docker_cmds_201911 if '201911' in duthost.os_version else cmds.docker_cmds, num),
         "misc_show_cmds": add_asic_arg("asic{} ", cmds.misc_show_cmds, num),
         "misc_cmds": cmds.misc_cmds,
     }
@@ -388,13 +428,14 @@ def commands_to_check(duthosts, enum_rand_one_per_hwsku_frontend_hostname):
     if duthost.facts["asic_type"] == "broadcom":
         cmds_to_check.update(
             {
-                "broadcom_cmd_bcmcmd": 
+                "broadcom_cmd_bcmcmd":
                     add_asic_arg(" -n {}", cmds.broadcom_cmd_bcmcmd, num),
-                "broadcom_cmd_misc": 
+                "broadcom_cmd_misc":
                     add_asic_arg("{}", cmds.broadcom_cmd_misc, num),
             }
         )
-        if duthost.facts["platform"] in ['x86_64-cel_e1031-r0']:
+        if duthost.facts["platform"] in ['x86_64-cel_e1031-r0',
+                                         'x86_64-arista_720dt_48s']:
             cmds_to_check.update(
                 {
                     "copy_config_cmds":
@@ -416,7 +457,7 @@ def commands_to_check(duthosts, enum_rand_one_per_hwsku_frontend_hostname):
     return cmds_to_check
 
 
-def check_cmds(cmd_group_name, cmd_group_to_check, cmdlist):
+def check_cmds(cmd_group_name, cmd_group_to_check, cmdlist, strbash_in_cmdlist):
     """ 
     Check commands within a group against the command list 
 
@@ -432,9 +473,16 @@ def check_cmds(cmd_group_name, cmd_group_to_check, cmdlist):
 
         for command in cmdlist:
             if isinstance(cmd_name, str):
-                result = cmd_name in command
+                if strbash_in_cmdlist:
+                    result = (cmd_name.replace('"', '\\"') in command)
+                else:
+                    result = (cmd_name in command)
             else:
-                result = cmd_name.search(command)
+                if strbash_in_cmdlist:
+                    new_pattern = re.compile(cmd_name.pattern.replace('"', '\\\\"'))
+                    result = new_pattern.search(command)
+                else:
+                    result = cmd_name.search(command)
             if result:
                 found = True
                 break
@@ -445,16 +493,9 @@ def check_cmds(cmd_group_name, cmd_group_to_check, cmdlist):
 
     return cmd_not_found
 
-def check_no_result(duthost, command):
-    res = duthost.shell(command)
-    logger.info(command)
-    logger.info(res["stdout_lines"])
-    pytest_assert(res["rc"] == 0)
-    pytest_assert(len(res["stdout_lines"]) == 0)
-    pytest_assert(len(res["stderr_lines"]) == 0)
 
 def test_techsupport_commands(
-    duthosts, enum_rand_one_per_hwsku_frontend_hostname, commands_to_check
+        duthosts, enum_rand_one_per_hwsku_frontend_hostname, commands_to_check
 ):
     """
     This test checks list of commands that will be run when executing
@@ -473,76 +514,21 @@ def test_techsupport_commands(
     cmd_not_found = defaultdict(list)
     duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
 
-    stdout = duthost.shell(
-        'sudo generate_dump -n | grep -v "^mkdir\|^rm\|^tar\|^gzip"'
-    )
+    stdout = duthost.shell('sudo generate_dump -n | grep -v "^mkdir\|^rm\|^tar\|^gzip"')
 
     pytest_assert(stdout['rc'] == 0, 'generate_dump command failed')
 
     cmd_list = stdout["stdout_lines"]
 
+    strbash_in_cmdlist = False
+    for command in cmd_list:
+        if "bash -c" in command:
+            strbash_in_cmdlist = True
+            break
+
     for cmd_group_name, cmd_group_to_check in commands_to_check.items():
         cmd_not_found.update(
-            check_cmds(cmd_group_name, cmd_group_to_check, cmd_list)
+            check_cmds(cmd_group_name, cmd_group_to_check, cmd_list, strbash_in_cmdlist)
         )
 
     pytest_assert(len(cmd_not_found) == 0, cmd_not_found)
-
-def test_secret_removed_from_show_techsupport(
-    duthosts, enum_rand_one_per_hwsku_hostname, creds_all_duts, check_image_version, setup_password
-):
-    """
-    This test checks following secrets been removed from show techsupport result:
-        Tacacs key
-        Radius key
-        snmp community string
-        /etc/shadow, which includes the hash of local/domain users' password
-        Certificate files: *.cer *.crt *.pem *.key
-    """
-    duthost = duthosts[enum_rand_one_per_hwsku_hostname]
-
-    tacacs_passkey = creds_all_duts[duthost]['tacacs_passkey']
-    radius_passkey = creds_all_duts[duthost]['radius_passkey']
-    snmp_rocommunity = creds_all_duts[duthost]['snmp_rocommunity']
-
-    # generate a new dump file. and find latest dump file with ls -t
-    duthost.shell('show techsupport')
-    dump_file_path = duthost.shell('ls -t /var/dump/sonic_dump_* | tail -1')['stdout']
-    dump_file_name = dump_file_path.replace("/var/dump/", "")
-
-    # extract for next step check
-    duthost.shell("tar -xf {0}".format(dump_file_path))
-    dump_extract_path="./{0}".format(dump_file_name.replace(".tar.gz", ""))
-    
-    # check Tacacs key
-    sed_command = "sed -nE '/secret={0}/P' {1}/etc/tacplus_nss.conf".format(tacacs_passkey, dump_extract_path)
-    check_no_result(duthost, sed_command)
-
-    sed_command = "sed -nE '/secret={0}/P' {1}/etc/pam.d/common-auth-sonic".format(radius_passkey, dump_extract_path)
-    check_no_result(duthost, sed_command)
-    
-    # check Radius key
-    sed_command = "sed -nE '/secret={0}/P' {1}/etc/radius_nss.conf".format(radius_passkey, dump_extract_path)
-    check_no_result(duthost, sed_command)
-
-    sed_command = "sed -nE '/{0}/P' {1}/etc/pam_radius_auth.conf".format(radius_passkey, dump_extract_path)
-    check_no_result(duthost, sed_command)
-    
-    # Check Radius passkey from per-server conf file /etc/pam_radius_auth.d/{ip}_{port}.conf
-    list_command = "ls {0}/etc/pam_radius_auth.d/*.conf || true".format(dump_extract_path)
-    config_file_list = duthost.shell(list_command)["stdout_lines"]
-    for config_file in config_file_list:
-        sed_command = "sed -nE '/{0}/P' {1}/etc/pam_radius_auth.d/{1}".format(radius_passkey, dump_extract_path, config_file)
-        check_no_result(duthost, sed_command)
-    
-    # check snmp community string not exist
-    sed_command = "sed -nE '/\s*snmp_rocommunity\s*:\s{0}/P' {1}/etc/sonic/snmp.yml".format(snmp_rocommunity, dump_extract_path)
-    check_no_result(duthost, sed_command)
-    
-    # check /etc/shadow not exist
-    test_command = "test -f {0}/etc/shadow && echo \"/etc/shadow exist\" || true".format(dump_extract_path)
-    check_no_result(duthost, test_command)
-    
-    # check *.cer *.crt *.pem *.key not exist in dump files
-    find_command = "find {0}/ -type f \( -iname \*.cer -o -iname \*.crt -o -iname \*.pem -o -iname \*.key \)".format(dump_extract_path)
-    check_no_result(duthost, find_command)

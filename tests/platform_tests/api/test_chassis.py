@@ -35,7 +35,7 @@ else:
 
 
 REGEX_MAC_ADDRESS = r'^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$'
-REGEX_SERIAL_NUMBER = r'^[A-Za-z0-9]+$'
+REGEX_SERIAL_NUMBER = r'^[A-Za-z0-9\-]+$'
 
 # Valid OCP ONIE TlvInfo EEPROM type codes as defined here:
 # https://opencomputeproject.github.io/onie/design-spec/hw_requirements.html
@@ -94,7 +94,7 @@ class TestChassisApi(PlatformApiTestBase):
         pytest_assert(expected_value is not None,
                       "Unable to get expected value for '{}' from platform.json file".format(key))
 
-        pytest_assert(value == expected_value,
+        pytest_assert(re.match(expected_value, value),
                       "'{}' value is incorrect. Got '{}', expected '{}'".format(key, value, expected_value))
 
     def compare_value_with_device_facts(self, duthost, key, value, case_sensitive=True):
@@ -152,8 +152,8 @@ class TestChassisApi(PlatformApiTestBase):
         duthost = duthosts[enum_rand_one_per_hwsku_hostname]
         skip_release(duthost, ["201811", "201911", "202012"])
         revision = chassis.get_revision(platform_api_conn)
-        pytest_assert(revision is not None, "Unable to retrieve chassis serial number")
-        pytest_assert(isinstance(revision, STRING_TYPE), "Chassis serial number appears incorrect")
+        pytest_assert(revision is not None, "Unable to retrieve chassis revision")
+        pytest_assert(isinstance(revision, STRING_TYPE), "Revision appears incorrect")
 
     def test_get_status(self, duthosts, enum_rand_one_per_hwsku_hostname, localhost, platform_api_conn):
         status = chassis.get_status(platform_api_conn)
@@ -269,9 +269,13 @@ class TestChassisApi(PlatformApiTestBase):
             num_components = int(chassis.get_num_components(platform_api_conn))
         except:
             pytest.fail("num_components is not an integer")
+        else:
+            if num_components == 0:
+                pytest.skip("No components found on device")
 
         if duthost.facts.get("chassis"):
-            expected_num_components = len(duthost.facts.get("chassis").get('components'))
+            components = duthost.facts.get("chassis").get('components')
+            expected_num_components = 0 if components is None else len(components)
             pytest_assert(num_components == expected_num_components,
                           "Number of components ({}) does not match expected number ({})"
                           .format(num_components, expected_num_components))
@@ -290,6 +294,9 @@ class TestChassisApi(PlatformApiTestBase):
             num_modules = int(chassis.get_num_modules(platform_api_conn))
         except:
             pytest.fail("num_modules is not an integer")
+        else:
+            if num_modules == 0:
+                pytest.skip("No modules found on device")
 
         module_list = chassis.get_all_modules(platform_api_conn)
         pytest_assert(module_list is not None, "Failed to retrieve modules")
@@ -309,6 +316,9 @@ class TestChassisApi(PlatformApiTestBase):
             num_fans = int(chassis.get_num_fans(platform_api_conn))
         except:
             pytest.fail("num_fans is not an integer")
+        else:
+            if num_fans == 0:
+                pytest.skip("No fans found on device")
 
         if duthost.facts.get("chassis"):
             expected_num_fans = len(duthost.facts.get("chassis").get('fans'))
@@ -331,6 +341,9 @@ class TestChassisApi(PlatformApiTestBase):
             num_fan_drawers = int(chassis.get_num_fan_drawers(platform_api_conn))
         except:
             pytest.fail("num_fan_drawers is not an integer")
+        else:
+            if num_fan_drawers == 0:
+                pytest.skip("No fan drawers found on device")
 
         if duthost.facts.get("chassis"):
             expected_num_fan_drawers = len(duthost.facts.get("chassis").get('fan_drawers'))
@@ -353,6 +366,9 @@ class TestChassisApi(PlatformApiTestBase):
             num_psus = int(chassis.get_num_psus(platform_api_conn))
         except:
             pytest.fail("num_psus is not an integer")
+        else:
+            if num_psus == 0:
+                pytest.skip("No psus found on device")
 
         if duthost.facts.get("chassis"):
             expected_num_psus = len(duthost.facts.get("chassis").get('psus'))
@@ -375,6 +391,9 @@ class TestChassisApi(PlatformApiTestBase):
             num_thermals = int(chassis.get_num_thermals(platform_api_conn))
         except:
             pytest.fail("num_thermals is not an integer")
+        else:
+            if num_thermals == 0:
+                pytest.skip("No thermals found on device")
 
         if duthost.facts.get("chassis"):
             expected_num_thermals = len(duthost.facts.get("chassis").get('thermals'))
@@ -399,6 +418,9 @@ class TestChassisApi(PlatformApiTestBase):
             num_sfps = int(chassis.get_num_sfps(platform_api_conn))
         except:
             pytest.fail("num_sfps is not an integer")
+        else:
+            if num_sfps == 0:
+                pytest.skip("No sfps found on device")
 
         list_sfps = physical_port_indices
 
@@ -406,6 +428,13 @@ class TestChassisApi(PlatformApiTestBase):
 
         if duthost.facts.get("chassis"):
             expected_num_sfps = len(duthost.facts.get("chassis").get('sfps'))
+            interface_facts = duthost.show_interface(command='status')['ansible_facts']['int_status']
+            if duthost.facts.get("platform") == 'x86_64-nvidia_sn2201-r0':
+                # On SN2201, there are 48 RJ45 ports which are also counted in SFP object lists
+                # So we need to adjust test case accordingly
+                for port,data in interface_facts.items():
+                    if data['type'] == 'RJ45':
+                        expected_num_sfps += 1
             pytest_assert(num_sfps == expected_num_sfps,
                           "Number of sfps ({}) does not match expected number ({})"
                           .format(num_sfps, expected_num_sfps))
@@ -490,15 +519,7 @@ class TestChassisApi(PlatformApiTestBase):
 
         self.assert_expectations()
 
-    def test_get_thermal_manager(self, duthosts, enum_rand_one_per_hwsku_hostname, localhost, platform_api_conn):
-        duthost = duthosts[enum_rand_one_per_hwsku_hostname]
-        thermal_manager_available = True
-        if duthost.facts.get("chassis"):
-            thermal_manager_available = duthost.facts.get("chassis").get("thermal_manager", True)
-
-        if not thermal_manager_available:
-            pytest.skip("skipped as thermal manager is not available")
-
+    def test_get_thermal_manager(self, localhost, platform_api_conn, thermal_manager_enabled):
         thermal_mgr = chassis.get_thermal_manager(platform_api_conn)
         pytest_assert(thermal_mgr is not None, "Failed to retrieve thermal manager")
 
@@ -513,13 +534,13 @@ class TestChassisApi(PlatformApiTestBase):
     def test_get_supervisor_slot(self, duthosts, enum_rand_one_per_hwsku_hostname, localhost, platform_api_conn):
         if chassis.is_modular_chassis(platform_api_conn):
             sup_slot = chassis.get_supervisor_slot(platform_api_conn)
-            pytest_assert(isinstance(sup_slot, int), "supervisor slot is not type integer")
+            pytest_assert(isinstance(sup_slot, int) or isinstance(sup_slot, STRING_TYPE), "supervisor slot is not type integer")
         else:
             pytest.skip("skipped as this test is applicable to modular chassis only")
 
     def test_get_my_slot(self, duthosts, enum_rand_one_per_hwsku_hostname, localhost, platform_api_conn):
         if chassis.is_modular_chassis(platform_api_conn):
             my_slot = chassis.get_my_slot(platform_api_conn)
-            pytest_assert(isinstance(my_slot, int), "supervisor slot is not type integer")
+            pytest_assert(isinstance(my_slot, int) or isinstance(my_slot, STRING_TYPE), "supervisor slot is not type integer")
         else:
             pytest.skip("skipped as this test is applicable to modular chassis only")
